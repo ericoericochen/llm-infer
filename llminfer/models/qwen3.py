@@ -11,10 +11,26 @@ class Qwen3ForCausalLM(nn.Module):
         self.config = config
         self.model = Qwen3Model(config)
 
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
     def forward(
-        self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ):
-        hidden_states = self.model(input_ids, attention_mask)
+        if position_ids is None:
+            position_ids = (
+                torch.arange(0, input_ids.shape[1], device=self.device)
+                .unsqueeze(0)
+                .repeat(input_ids.shape[0], 1)
+            )
+
+        hidden_states = self.model(
+            input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
 
     @torch.inference_mode()
     def generate(self):
@@ -34,19 +50,31 @@ class Qwen3Model(nn.Module):
         )
 
     def forward(
-        self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ):
         hidden_states = self.embed_tokens(input_ids)
 
         # create casual mask
 
+        # compute rope sin, cos positional embeddings
+        positional_embeddings = self.rope(position_ids)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+            hidden_states = layer(
+                hidden_states,
+                positional_embeddings=positional_embeddings,
+                attention_mask=attention_mask,
+            )
             break
 
 
 def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
-    pass
+    x1, x2 = x.chunk(2, dim=-1)
+    x1 = x1 * cos - x2 * sin
+    x2 = x1 * sin + x2 * cos
+    return torch.cat((x1, x2), dim=-1)
 
 
 class Qwen3RotaryEmbeddings(nn.Module):
@@ -79,11 +107,18 @@ class Qwen3DecoderLayer(nn.Module):
         self.mlp = Qwen3MLP()
 
     def forward(
-        self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+        self,
+        hidden_states: torch.Tensor,
+        positional_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask)
+        hidden_states = self.self_attn(
+            hidden_states,
+            positional_embeddings=positional_embeddings,
+            attention_mask=attention_mask,
+        )
 
         # print("hidden_states: ", hidden_states.shape)
 
@@ -144,7 +179,10 @@ class Qwen3Attention(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+        self,
+        hidden_states: torch.Tensor,
+        positional_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ):
         # project to qkv
         q = self.proj_and_reshape(hidden_states, self.q_proj)
@@ -156,6 +194,9 @@ class Qwen3Attention(nn.Module):
         k = self.k_norm(k)
 
         # apply rope
+        sin, cos = positional_embeddings
+        q = apply_rope(q, sin, cos)
+        k = apply_rope(k, sin, cos)
 
         # self attention
 
