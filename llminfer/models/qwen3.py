@@ -1,8 +1,53 @@
+import os
+import glob
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from typing import Optional
+from safetensors import safe_open
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, Iterable
 from transformers import Qwen3Config
+from huggingface_hub import snapshot_download
+
+
+def create_causal_mask(
+    hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    batch_size = hidden_states.shape[0]
+    seq_len = hidden_states.shape[1]
+    mask = torch.tril(torch.ones((batch_size, seq_len, seq_len))).bool()
+
+    if attention_mask is not None:
+        # [batch_size, 1, seq_len] broacastable to mask
+        attention_mask = attention_mask.unsqueeze(1).bool()
+        mask = mask & attention_mask
+
+    return mask.unsqueeze(1)
+
+
+def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    y1 = x1 * cos - x2 * sin
+    y2 = x1 * sin + x2 * cos
+    return torch.cat((y1, y2), dim=-1)
+
+
+@torch.no_grad()
+def load_weights(model: nn.Module, safetensor_files: Iterable[Path | str]):
+    for file in safetensor_files:
+        with safe_open(file, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                weight = f.get_tensor(key)
+                param = model.get_parameter(key)
+                param.copy_(weight)
+
+
+@dataclass
+class CausalLMOutput:
+    logits: torch.Tensor
+    hidden_states: torch.Tensor
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -10,6 +55,18 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen3Model(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str):
+        config = Qwen3Config.from_pretrained(pretrained_model_name_or_path)
+        model = cls(config)
+        snapshot_dir = snapshot_download(
+            pretrained_model_name_or_path, local_files_only=True
+        )
+        safetensor_files = Path(snapshot_dir).glob("*.safetensors")
+        load_weights(model, safetensor_files)
+        return model
 
     @property
     def device(self):
@@ -32,6 +89,9 @@ class Qwen3ForCausalLM(nn.Module):
             input_ids, position_ids=position_ids, attention_mask=attention_mask
         )
 
+        logits = self.lm_head(hidden_states)
+        return CausalLMOutput(logits=logits, hidden_states=hidden_states)
+
     @torch.inference_mode()
     def generate(self):
         pass
@@ -48,6 +108,7 @@ class Qwen3Model(nn.Module):
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -58,6 +119,7 @@ class Qwen3Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
 
         # create casual mask
+        attention_mask = create_causal_mask(hidden_states, attention_mask)
 
         # compute rope sin, cos positional embeddings
         positional_embeddings = self.rope(position_ids)
@@ -67,14 +129,12 @@ class Qwen3Model(nn.Module):
                 positional_embeddings=positional_embeddings,
                 attention_mask=attention_mask,
             )
-            break
+            # break
 
+        # print("hidden_states: ", hidden_states)
 
-def apply_rope(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    x1 = x1 * cos - x2 * sin
-    x2 = x1 * sin + x2 * cos
-    return torch.cat((x1, x2), dim=-1)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
 
 
 class Qwen3RotaryEmbeddings(nn.Module):
@@ -104,7 +164,7 @@ class Qwen3DecoderLayer(nn.Module):
         self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = Qwen3MLP()
+        self.mlp = Qwen3MLP(config)
 
     def forward(
         self,
@@ -112,6 +172,9 @@ class Qwen3DecoderLayer(nn.Module):
         positional_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # pre-norm -> function -> residual
+
+        # self attn
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -119,8 +182,14 @@ class Qwen3DecoderLayer(nn.Module):
             positional_embeddings=positional_embeddings,
             attention_mask=attention_mask,
         )
+        hidden_states = residual + hidden_states
 
-        # print("hidden_states: ", hidden_states.shape)
+        # mlp
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
 class Qwen3RMSNorm(nn.Module):
@@ -132,16 +201,10 @@ class Qwen3RMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).sum(-1, keepdim=True)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
         rrms = torch.rsqrt(variance + self.eps)
         hidden_states = (rrms * hidden_states) * self.weight
         return hidden_states.to(input_dtype)
-
-
-def create_causal_mask(
-    hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    pass
 
 
 class Qwen3Attention(nn.Module):
@@ -165,6 +228,11 @@ class Qwen3Attention(nn.Module):
             config.num_key_value_heads * config.head_dim,
             bias=config.attention_bias,
         )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
 
         self.q_norm = Qwen3RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(config.head_dim, eps=config.rms_norm_eps)
@@ -184,6 +252,10 @@ class Qwen3Attention(nn.Module):
         positional_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
     ):
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # print("hidden_states: ", hidden_states)
+
         # project to qkv
         q = self.proj_and_reshape(hidden_states, self.q_proj)
         k = self.proj_and_reshape(hidden_states, self.k_proj)
@@ -198,8 +270,29 @@ class Qwen3Attention(nn.Module):
         q = apply_rope(q, sin, cos)
         k = apply_rope(k, sin, cos)
 
-        # self attention
+        # group query attention
+        group_size = q.shape[1] // k.shape[1]
+        k = torch.repeat_interleave(k, repeats=group_size, dim=1)
+        v = torch.repeat_interleave(v, repeats=group_size, dim=1)
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+
+        # out projection
+        attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        out = self.o_proj(attn_out)
+        return out
 
 
 class Qwen3MLP(nn.Module):
-    pass
+    def __init__(self, config: Qwen3Config):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        self.act = nn.SiLU()
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor):
+        return self.down_proj(
+            self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        )
