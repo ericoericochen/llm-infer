@@ -1,5 +1,3 @@
-import os
-import glob
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,6 +54,7 @@ class Qwen3ForCausalLM(nn.Module):
         self.config = config
         self.model = Qwen3Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.kv_cache = {}
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str):
@@ -93,13 +92,19 @@ class Qwen3ForCausalLM(nn.Module):
         return CausalLMOutput(logits=logits, hidden_states=hidden_states)
 
     @torch.inference_mode()
-    def generate(self, input_ids: torch.Tensor, temperature: float = 1.0):
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_tokens: int = 128,
+        temperature: float = 1.0,
+        use_cache: bool = True,
+    ):
         self.eval()
 
         # assume batch_size is 1
         assert input_ids.shape[0] == 1
         eos_token_id = self.config.eos_token_id
-        while True:
+        for _ in range(max_tokens):
             output = self.forward(input_ids)
             logits = output.logits[:, -1, :]
 
