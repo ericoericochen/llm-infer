@@ -9,6 +9,8 @@ from typing import Optional, Iterable
 from transformers import Qwen3Config
 from huggingface_hub import snapshot_download
 
+from ..kv_cache import KVCache
+
 
 def create_causal_mask(
     hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
@@ -54,7 +56,6 @@ class Qwen3ForCausalLM(nn.Module):
         self.config = config
         self.model = Qwen3Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.kv_cache = {}
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str):
@@ -76,6 +77,7 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
     ):
         if position_ids is None:
             position_ids = (
@@ -85,7 +87,10 @@ class Qwen3ForCausalLM(nn.Module):
             )
 
         hidden_states = self.model(
-            input_ids, position_ids=position_ids, attention_mask=attention_mask
+            input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            kv_cache=kv_cache,
         )
 
         logits = self.lm_head(hidden_states)
@@ -97,7 +102,6 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         max_tokens: int = 128,
         temperature: float = 1.0,
-        use_cache: bool = True,
     ):
         self.eval()
 
@@ -133,7 +137,10 @@ class Qwen3Model(nn.Module):
         )
         self.rope = Qwen3RotaryEmbeddings(config)
         self.layers = nn.ModuleList(
-            [Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                Qwen3DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -142,6 +149,7 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
     ):
         hidden_states = self.embed_tokens(input_ids)
 
@@ -150,11 +158,13 @@ class Qwen3Model(nn.Module):
 
         # compute rope sin, cos positional embeddings
         positional_embeddings = self.rope(position_ids)
+
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
                 positional_embeddings=positional_embeddings,
                 attention_mask=attention_mask,
+                kv_cache=kv_cache,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -181,10 +191,11 @@ class Qwen3RotaryEmbeddings(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = Qwen3Attention(config)
+        self.self_attn = Qwen3Attention(config, layer_idx)
         self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -195,6 +206,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         positional_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
     ) -> torch.Tensor:
         # pre-norm -> function -> residual
 
@@ -205,6 +217,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states,
             positional_embeddings=positional_embeddings,
             attention_mask=attention_mask,
+            kv_cache=kv_cache,
         )
         hidden_states = residual + hidden_states
 
@@ -234,9 +247,10 @@ class Qwen3RMSNorm(nn.Module):
 class Qwen3Attention(nn.Module):
     """Group Query Attention"""
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.head_dim = config.head_dim
+        self.layer_idx = layer_idx
         self.q_proj = nn.Linear(
             config.hidden_size,
             config.num_attention_heads * config.head_dim,
@@ -275,10 +289,9 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         positional_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
     ):
         batch_size, seq_len, _ = hidden_states.shape
-
-        # print("hidden_states: ", hidden_states)
 
         # project to qkv
         q = self.proj_and_reshape(hidden_states, self.q_proj)
@@ -294,15 +307,63 @@ class Qwen3Attention(nn.Module):
         q = apply_rope(q, sin, cos)
         k = apply_rope(k, sin, cos)
 
+        prefill = not kv_cache or (kv_cache and kv_cache.pos_idx == 0)
+
+        # TODO: handle kv cache
+        if kv_cache is not None:
+            if kv_cache.pos_idx != 0:
+                # print("decode: ", self.layer_idx)
+                cached_k, cached_v = kv_cache.get_cached_layer(self.layer_idx)
+                kv_cache.update(k=k, v=v, layer_idx=self.layer_idx)
+
+                # if self.layer_idx == 0:
+                #     print("cached_k: ", cached_k)
+
+                k = torch.cat((cached_k, k), dim=2)
+                v = torch.cat((cached_v, v), dim=2)
+                # print("k: ", k.shape, "v: ", v.shape, "q: ", q.shape)
+
+                if self.layer_idx == kv_cache.num_layers - 1:
+                    kv_cache.advance(seq_len)
+            else:
+                kv_cache.update(k=k, v=v, layer_idx=self.layer_idx)
+                if self.layer_idx == 0:
+                    pass
+                    # print("going to store k: ", k[0, :, 0, :])
+                    # print("going to store v: ", v[0, :, 0, :])
+                    # print("cached k is: ", kv_cache.get_layer(0)[0][0, :, 0, :])
+                    # print("cached v is: ", kv_cache.get_layer(0)[1][0, :, 0, :])
+                if self.layer_idx == kv_cache.num_layers - 1:
+                    kv_cache.advance(seq_len)
+
+        if self.layer_idx == 0 and (kv_cache is None or kv_cache.pos_idx != 0):
+            pass
+            # print("q: ", q[0, :, -1, :])
+            # # print("k: ", k[0, :, :, :])
+            # # print("v: ", v[0, :, :, :])
+            # print("k: ", k.shape)
+            # print("v: ", v.shape)
+
         # group query attention
         group_size = q.shape[1] // k.shape[1]
         k = torch.repeat_interleave(k, repeats=group_size, dim=1)
         v = torch.repeat_interleave(v, repeats=group_size, dim=1)
-        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=prefill)
+        # attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+        # if self.layer_idx == 0 and (kv_cache is None or kv_cache.pos_idx != 0):
+        #     print("attn_out: ", attn_out[0, :, -1, :])
+
+        # attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
 
         # out projection
         attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, -1)
         out = self.o_proj(attn_out)
+
+        # if self.layer_idx == 0 and (kv_cache is None or kv_cache.pos_idx != 0):
+        #     print("out: ", out[0, -1, :])
+
         return out
 
 

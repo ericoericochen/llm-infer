@@ -11,7 +11,7 @@ if __name__ == "__main__":
     messages = [
         {
             "role": "user",
-            "content": "Explain large language models to a 5 year old in 5 sentences.",
+            "content": "What is the pH scale in one sentence?",
         }
     ]
     text = tokenizer.apply_chat_template(
