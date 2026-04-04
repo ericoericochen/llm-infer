@@ -93,8 +93,30 @@ class Qwen3ForCausalLM(nn.Module):
         return CausalLMOutput(logits=logits, hidden_states=hidden_states)
 
     @torch.inference_mode()
-    def generate(self):
-        pass
+    def generate(self, input_ids: torch.Tensor, temperature: float = 1.0):
+        self.eval()
+
+        # assume batch_size is 1
+        assert input_ids.shape[0] == 1
+        eos_token_id = self.config.eos_token_id
+        while True:
+            output = self.forward(input_ids)
+            logits = output.logits[:, -1, :]
+
+            if temperature > 0:
+                logits = logits / temperature
+                probs = logits.softmax(dim=-1)
+                next_token_id = torch.multinomial(probs, num_samples=1)
+                token_id = int(next_token_id[0][0])
+            else:
+                next_token_id = logits.argmax(dim=-1, keepdim=True)
+                token_id = int(next_token_id[0][0])
+
+            # autoregressively decode - add next token id back to input_ids
+            input_ids = torch.cat((input_ids, next_token_id), dim=1)
+            yield token_id
+            if token_id == eos_token_id:
+                break
 
 
 class Qwen3Model(nn.Module):
@@ -129,9 +151,6 @@ class Qwen3Model(nn.Module):
                 positional_embeddings=positional_embeddings,
                 attention_mask=attention_mask,
             )
-            # break
-
-        # print("hidden_states: ", hidden_states)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
